@@ -2,58 +2,20 @@
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <fstream>
 #include <unistd.h>
 
 #include <fcntl.h>
 #include <termios.h>
+#include <poll.h>
 
 #include <boost/program_options.hpp>
+#include <variant>
 
-speed_t get_baud(int baud)
-{
-    switch (baud) {
-    case 9600:
-        return B9600;
-    case 19200:
-        return B19200;
-    case 38400:
-        return B38400;
-    case 57600:
-        return B57600;
-    case 115200:
-        return B115200;
-    case 230400:
-        return B230400;
-    case 460800:
-        return B460800;
-    case 500000:
-        return B500000;
-    case 576000:
-        return B576000;
-    case 921600:
-        return B921600;
-    case 1000000:
-        return B1000000;
-    case 1152000:
-        return B1152000;
-    case 1500000:
-        return B1500000;
-    case 2000000:
-        return B2000000;
-    case 2500000:
-        return B2500000;
-    case 3000000:
-        return B3000000;
-    case 3500000:
-        return B3500000;
-    case 4000000:
-        return B4000000;
-    default: 
-        return -1;
-    }
-}
+#include "../shared/commands.h"
+#include "serial.h"
 
 void check_path_exists(const std::string& path){
   if(!std::filesystem::exists(path)){
@@ -62,32 +24,220 @@ void check_path_exists(const std::string& path){
   }
 }
 
+/// @param timeout in ms
+int wait_for_read(int fd, uint8_t buffer[], size_t count, int timeout){
+  {
+    struct termios tm;
+    tcgetattr(fd, &tm);
+    tm.c_cc[VTIME] = 1; // inter-character timeout 100ms, valid after first char recvd
+    tm.c_cc[VMIN] = count; // block until n characters are read
+    tcsetattr(fd, TCSANOW, &tm);
+  }
+  struct pollfd pfd{
+    .fd = fd,
+    .events = POLLIN
+  };
+  int rc = poll(&pfd, 1, timeout);
+  if(rc > 0){
+    rc = read(fd, buffer, count);
+    if(rc == -1){
+      perror("read");
+      return 0;
+    }
+    return rc;
+  }
+  return 0;
+}
+
+bool echo_test(int serial, N_t message){
+    const Command c {Command::EchoN};
+    write(serial, (char*)&c, sizeof(Command)); 
+    write(serial, (char*)&message, sizeof(N_t));
+
+    Ans answer;
+    if(wait_for_read(serial, (uint8_t*)&answer, sizeof(answer), 1000)<=0){
+      std::cerr << "[ERROR] failed to read echo ans" << std::endl;
+      return false;
+    }
+
+    if(answer != Ans::OK){
+      std::cerr << "[ERROR] echo result: " << (char)answer << std::endl;
+      return false;
+    }
+
+    N_t message_received;
+    if(wait_for_read(serial, (uint8_t*)&message_received, sizeof(N_t), 1000)<=0){
+      std::cerr << "[ERROR] failed to read echo message" << std::endl;
+      return false;
+    }
+    
+
+    if(message_received != message){
+      fprintf(stderr, "[ERROR] echo test failed, received: %#x\n", message_received);
+      return false;
+    }
+    return true;
+}
+
+bool WriteNBytes(int fd, uint8_t bytes[], size_t n){
+  assert(n < std::numeric_limits<N_t>::max());
+  do{
+      // write header
+      const Command c {Command::WriteNBytes};
+      write(fd, (char*)&c, sizeof(Command)); 
+      // write N
+
+      write(fd, (char*)&n, sizeof(N_t));
+
+      // write data
+      write(fd, bytes, n);
+
+
+      // read answer
+      Ans answer{Ans::NOK};
+      if(wait_for_read(fd, (uint8_t*)&answer, sizeof(Ans), 10000)<=0){
+        std::cerr << "[ERROR] failed to read ans" << std::endl;
+        return false;
+      }
+
+      // if No OK, then try again
+      if(answer == Ans::NOK)
+          continue;
+      break;
+  }while(1);
+  return true;
+}
+
+bool WriteNZeros(int fd, size_t n){
+  assert(n < std::numeric_limits<N_t>::max());
+  do{
+      // write header
+      const Command c {Command::WriteNZeros};
+      write(fd, (char*)&c, sizeof(Command)); 
+      // write N
+      write(fd, (char*)&n, sizeof(N_t));
+
+      // read answer
+      Ans answer{Ans::NOK};
+      if(wait_for_read(fd, (uint8_t*)&answer, sizeof(Ans), 10000)<=0){
+        std::cerr << "[ERROR] failed to read ans" << std::endl;
+        return false;
+      }
+
+      // if No OK, then try again
+      if(answer == Ans::NOK)
+          continue;
+      break;
+  }while(1);
+  return true;
+}
+
+// helper type for the visitor
+template<class... Ts>
+struct match : Ts... { using Ts::operator()...; };
+template<typename...Func> match(Func...) -> match<Func...>;
+
+template <typename... Ts, typename... Fs>
+constexpr decltype(auto) operator| (std::variant<Ts...> const& v, match<Fs...> const& match) {
+    return std::visit(match, v);
+}
+
+using DataBlocks = std::vector<std::variant<std::vector<uint8_t>, size_t>>;
+
+DataBlocks read_stream(std::istream& stream, const size_t max_cons_zeros = 8){
+  DataBlocks data{};
+  size_t cons_zeros{0};
+  std::for_each(
+    std::istreambuf_iterator<char>(stream),
+    std::istreambuf_iterator<char>(),
+    [&data, &cons_zeros, max_cons_zeros](const uint8_t c){
+        if(c == 0x00){
+          // if last block was zeros, then add this
+          if(!data.empty())
+            if(auto* zeros = std::get_if<size_t>(&data.back())){
+              *zeros += 1;
+              return;
+            }
+          // add to consecutive zeros
+          cons_zeros += 1;
+          if(cons_zeros <= max_cons_zeros)
+            return;
+          // if enough consecutive zeros
+          data.push_back(std::forward<size_t>(cons_zeros));
+          cons_zeros = 0;
+        }else{
+          // if block exists add to it
+          if(!data.empty())
+            if(auto* block = std::get_if<std::vector<uint8_t>>(&data.back())){
+              block->push_back(c);
+              return;
+            }
+          // else create new block
+          data.push_back(std::vector<uint8_t>(c));
+        }
+    }
+  );
+  // if zeros
+  if(cons_zeros > 0){
+    if(!data.empty()){
+      // the last block should always be data at this point
+      auto& block = std::get<std::vector<uint8_t>>(data.back());
+      block.insert(block.end(), cons_zeros,0);      
+    }else{
+      data.push_back(std::vector<uint8_t>(cons_zeros, 0));
+    }
+  }
+  // for(auto&& block : data){
+  //   if(auto* data = std::get_if<std::vector<uint8_t>>(&block))
+  //     std::cout << "data of size: " <<  data->size() << std::endl;
+  //   else if(auto* zeros = std::get_if<size_t>(&block))
+  //     std::cout << "zeros of size: " << *zeros << std::endl;
+
+  // }
+  return data;
+}
+
+static int memvcmp(void *memory, unsigned char val, unsigned int size)
+{
+    unsigned char *mm = (unsigned char*)memory;
+    return (*mm == val) && memcmp(mm, mm + 1, size - 1) == 0;
+}
+
 int main(int argc, char** argv){
   namespace po = boost::program_options;
 
   po::options_description desc("");
   desc.add_options()
     ("help,h", "produces help message")
-    ("input-file", po::value<std::string>()->required()->notifier(check_path_exists), "input file")
+    ("input-file", po::value<std::string>()->notifier(check_path_exists), "input file")
     ("port,p", po::value<std::string>()->required()->notifier(check_path_exists), "EEprogm programator port")
-    ("baudrate,b", po::value<unsigned int>()->default_value(9600), "baudrate for the port");
+    ("test,t", "send echo before any transmission to test connection")
+    ("baudrate,b", po::value<int>()->default_value(9600), "baudrate for the port");
+
 
   po::positional_options_description p;
   p.add("input-file", 1);
 
   po::variables_map vm;
-  po::store(po::command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
-  po::notify(vm);
 
-  if(vm.count("help") || !vm.count("port")){
-    std::cout << desc << '\n';
-    // std::
-    return EXIT_SUCCESS;
+  try{
+    po::store(po::command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
+    po::notify(vm);
+  }catch(po::error& e){
+    std::cerr << "[ERROR] " << e.what() << "\n";
+    std::cout << desc << "\n";
+    return EXIT_FAILURE;
   }
 
-  std::vector<uint8_t> data{};
+  // if(vm.count("help") || !vm.count("port")){
+  //   std::cout << desc << '\n';
+  //   // std::
+  //   return EXIT_SUCCESS;
+  // }
+
+  DataBlocks data_blocks;
   if(vm.count("input-file")){
-    std::string filename = vm["intput-file"].as<std::string>();
+    std::string filename = vm["input-file"].as<std::string>();
 
     std::ifstream file(filename, std::ios::binary);
 
@@ -100,86 +250,75 @@ int main(int argc, char** argv){
     file.seekg(0, std::ios::beg);
 
     // reserve and read file
-    data.reserve(file_size);
-    data.insert(data.begin(),
-                std::istream_iterator<uint8_t>(file),
-                std::istream_iterator<uint8_t>());    
+    data_blocks = read_stream(file);
   }else{
-    if(isatty(STDOUT_FILENO)){ // if pipe is used
-      fprintf(stderr, "no input-file provided (or data piped)!");
+    if(isatty(STDIN_FILENO)){ // if stdin is not a pipe
+      fprintf(stderr, "[ERORR] no input-file provided (or data piped)!");
       return EXIT_FAILURE;
     }
     // read data from stream until end
-    std::for_each(std::istreambuf_iterator<char>(std::cin),
-                  std::istreambuf_iterator<char>(),
-                  [&data](const uint8_t c){
-                      data.push_back(c);
-                  });
+    data_blocks = read_stream(std::cin);    
   }
 
+    int serial = setup_serial(vm["port"].as<std::string>(), vm["baudrate"].as<int>());
+    if(serial == -1){
+        return EXIT_FAILURE;
+    }
 
-  std::string serial_path{vm["port"].as<std::string>()};
-  int serial = open(serial_path.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
 
-  if(serial < 0){
-    std::cerr << "Failed when opening serial port:\n";
-    std::cerr << '\t' << strerror(errno) << std::endl;
-    return EXIT_FAILURE;
-  }
+    // ECHO
+    if(vm.count("test")){
+      if(echo_test(serial, 0xDEAD) && echo_test(serial, 0xBEAF))
+        std::cout << "[INFO] ECHO success" << std::endl;
+      else
+        return EXIT_FAILURE;
+    }
 
-  struct termios tty{};
+    const size_t PAGE_SIZE = 64;
+    const size_t CHUNK_SIZE = 4; // 32 bits (half of arduino's serial buffer)
 
-  if (tcgetattr(serial, &tty) != 0)
-  {
-      std::cerr << "tcgetattr(" << serial_path << "): " << strerror(errno) << std::endl;
-      return EXIT_FAILURE;
-  }
-  
+    size_t total_sent{0};
+    
+    for(auto&& block : data_blocks){
+      bool ret = block | match{
+       [=,&total_sent](size_t zeros){ // for block of n zeros
+        if(!WriteNZeros(serial, zeros)){
+          return false;
+        }
+        total_sent += zeros;
+        std::cout << "[INFO] Sent " << zeros << " zeros, that's " << total_sent << " bytes total" << std::endl;
+        return true;
+       },
+       [=, &total_sent](std::vector<uint8_t> data){ // for block of data
+        for(int index=0; index < data.size(); index+=PAGE_SIZE){
+          N_t write_n = std::min(PAGE_SIZE, data.size()-index);
 
-  tty.c_cflag &= ~PARENB;
-  tty.c_cflag &= ~CSTOPB;
-  tty.c_cflag &= ~CSIZE;
-  tty.c_cflag |= CS8;
-  tty.c_cflag &= ~CRTSCTS;
-  tty.c_cflag |= CREAD | CLOCAL;
+          if(!WriteNBytes(serial, &data[index], write_n)){
+            return false;
+          }
 
-  tty.c_lflag &= ~ICANON;
-  tty.c_lflag &= ~ECHO;
-  tty.c_lflag &= ~ECHOE;
-  tty.c_lflag &= ~ECHONL;
-  tty.c_lflag &= ~ISIG;
-  tty.c_iflag &= ~(IXON | IXOFF | IXANY); 
-  tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);
+          total_sent += write_n;
 
-  tty.c_oflag &= ~OPOST;
-  tty.c_oflag &= ~ONLCR;
+          std::cout << "[INFO] Sent " << write_n << " bytes, that's " << total_sent << " bytes total" << std::endl;
+        }
+        return true;
+       },
+      };
+      if(!ret){
+        return EXIT_FAILURE;
+      }
+    }
 
-  tty.c_cc[VTIME] = 0;
-  tty.c_cc[VMIN] = 0;
+    Command c {Command::CheckBytes};
+    write(serial, (char*)&c, sizeof(Command));
 
-  speed_t baudrate = get_baud(vm["baudrate"].as<int>());
-  if(baudrate == -1){
-    std::cerr << "Invalid baudrate!" << std::endl;
-    return EXIT_FAILURE;
-  }
-
-  cfsetispeed(&tty, baudrate);
-  cfsetospeed(&tty, baudrate);
-
-  if (tcsetattr(serial, TCSANOW, &tty) != 0) {
-      std::cerr << "tcgetattr("<< serial_path << "): " << strerror(errno) << std::endl;
-      return EXIT_FAILURE;
-  }
-
-  const size_t CHUNK_SIZE = 4; // 32 bits (half of arduino's serial buffer)
-  
-  for(int index=0; index < data.size(); index+=CHUNK_SIZE){
-    // write header
-
-    // write data
-    write(serial, &data[index], CHUNK_SIZE);
-
-    uint8_t recv[2];
-    read(serial, recv, 2)
-  }
+    Ans answer;
+    wait_for_read(serial, (uint8_t*)&answer, sizeof(Ans), 100);
+    if(answer == Ans::NOK){
+        std::cerr << "[ERROR] Bytes were written wrongly" << std::endl;
+        return EXIT_FAILURE;
+    }else{
+        std::cout << "[INFO] Upload Successfull 🎊" << std::endl;
+    }
+    
 }

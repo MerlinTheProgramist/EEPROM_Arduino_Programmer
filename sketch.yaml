@@ -1,3 +1,0 @@
-default_fqbn: esp32:esp32:esp32
-default_programmer: /dev/ttyS0
-default_port: /dev/ttyS0

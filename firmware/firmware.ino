@@ -5,6 +5,7 @@
 // #endif
 
 #include "../shared/commands.h"
+#include "../shared/config.h"
 
 const int 
   SHIFT_DATA = 32,
@@ -13,9 +14,6 @@ const int
   WRITE_EN = 26;
 const int DATA_PINS[] = {13, 4, 21, 5, 18, 23, 19, 22};
 
-const size_t EEPROM_SIZE = 32768;
-const size_t EEPROM_PAGE_SIZE = 64;
-const size_t EEPROM_PAGE_ADDR_MASK = EEPROM_PAGE_SIZE-1;
 
 void setAddress(int address, bool outputEnable){
   shiftOut(SHIFT_DATA, SHIFT_CLK, MSBFIRST, (address >> 8) | (outputEnable ? 0x0 : 0x80));
@@ -52,14 +50,13 @@ void writeByteEEPROM(int address, byte data){
 }
 
 inline 
-void writePageEEPROM(int address, byte pageBytes[], const byte byte_n=EEPROM_PAGE_SIZE){
+void writePageEEPROM(int address, const byte pageBytes[], const byte byte_n=EEPROM_PAGE_SIZE){
   for(int offset=0;offset<byte_n;++offset){
     byte data = pageBytes[offset];
     setAddress(address+offset, false);
     for(int pin = 0; pin <= 7; ++pin){
       pinMode(DATA_PINS[pin], OUTPUT);
-      digitalWrite(DATA_PINS[pin], data & 1);
-      data >>= 1;
+      digitalWrite(DATA_PINS[pin], (data>>pin)&1);
     }
 
     digitalWrite(WRITE_EN, LOW);
@@ -77,6 +74,7 @@ void fillPageEEPROM(int address, const byte fill = 0, const byte byte_n=EEPROM_P
 
   for(int offset=0;offset<byte_n;++offset){
     setAddress(address+offset, false);
+    delayMicroseconds(10);
 
     digitalWrite(WRITE_EN, LOW);
     delayMicroseconds(10); // min: 100ns, max: 150us
@@ -93,51 +91,6 @@ void fillPageEEPROM(int address, const byte fill = 0, const byte byte_n=EEPROM_P
   // }
 // }
 
-void printContents(){
-  byte last[16];
-  bool last_dup{false};
-  bool duplicate{false};
-  for(int base = 0;base <= 0x7ff0; base += 16){
-    byte data[16];
-    last_dup = duplicate;
-    duplicate = true;
-    for(int offset = 0; offset <= 15; ++offset){
-      data[offset] = readEEPROM(base + offset);
-      if(data[offset]!=last[offset])
-        duplicate = false;
-    }
-    if(duplicate){
-      continue;
-    }
-    if(last_dup)
-      Serial.println("*");
-      
-    char buf[80];
-    sprintf(buf, "%03x:  %02x %02x %02x %02x %02x %02x %02x %02x   %02x %02x %02x %02x %02x %02x %02x %02x",
-       base, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
-
-    Serial.println(buf);
-    memcpy(last, data, sizeof(data));
-  }
-}
-
-
-/*
-const byte code[] = {
-  0xa9, 0xff,       // lda $ff (LOAD 0xFF to A)
-  0x8d, 0x02, 0x60, // sta $6002 (STORE A to addr $6002)
-
-  0xa9, 0x55,       // lda $55
-  0x8d, 0x00, 0x60, // sta $6000
-
-  0xa9, 0xaa,       // lda $aa
-  0x8d, 0x00, 0x60, // sta $6000
-
-  0x4c, 0x05, 0x80  // jmp $8005
-};
-*/
-
 void setup(){  
   digitalWrite(WRITE_EN, HIGH); // set WRITE ENABLE high initially
   pinMode(WRITE_EN, OUTPUT);
@@ -146,19 +99,8 @@ void setup(){
   pinMode(SHIFT_CLK, OUTPUT);
   pinMode(SHIFT_LATCH, OUTPUT);
 
-
-  Serial.begin(115200);
+  Serial.begin(DEFAULT_BAUDRATE);
   Serial.setTimeout(1000);
-
-  // esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_FIXED;
-  // esp_bt_pin_code_t pin_code = {'4', '6', '2', '6',}; 
-  // esp_bt_gap_set_pin(pin_type, 4, pin_code);
-  
-  // BluetoothSerial SerialBT;
-  // SerialBT.register_callback(btCallback);
-  // SerialBT.begin("EEPROM_programmator");
-
-  // printContents();
 }
 
 template<typename T>  inline 
@@ -190,19 +132,18 @@ bool parseCommand(){
 
         int read = 0;
         while(read < n){
-          int available  = Serial.available();
-          if(!available)
+          if(!Serial.available())
             return false;
-          read += Serial.readBytes(data + addr + read, n - read);
+          read += Serial.readBytes(&data[addr + read], n - read);
         }
 
-
         // first fill the previous page
-        size_t page_addr = addr & EEPROM_PAGE_ADDR_MASK;
-        if(page_addr != 0){
-          size_t write = (n > (EEPROM_PAGE_SIZE - page_addr))?(n-(EEPROM_PAGE_SIZE - page_addr)) : n;
-          n-=write;
-          writePageEEPROM(addr, &data[addr], write);
+        const size_t page_offset = addr & EEPROM_PAGE_ADDR_MASK;
+        if(page_offset != 0){
+          const size_t written = (n > (EEPROM_PAGE_SIZE - page_offset))?(EEPROM_PAGE_SIZE - page_offset) : n;
+          n-=written;
+          writePageEEPROM(addr, &data[addr], written);
+          addr += written;
         }
         
         while(n > 0){
@@ -222,31 +163,36 @@ bool parseCommand(){
         memset(&data[addr], 0, n);
         
         // first fill the previous page
-        size_t page_addr = addr & EEPROM_PAGE_ADDR_MASK;
-        if(page_addr != 0){
-          size_t write = (n > (EEPROM_PAGE_SIZE - page_addr))?(n-(EEPROM_PAGE_SIZE - page_addr)) : n;
-          n-=write;
-          writePageEEPROM(addr, &data[addr], write);
+        const size_t page_offset = addr & EEPROM_PAGE_ADDR_MASK;
+        if(page_offset != 0){
+          const size_t written = (n > (EEPROM_PAGE_SIZE - page_offset))?(EEPROM_PAGE_SIZE - page_offset) : n;
+          n-=written;
+          fillPageEEPROM(addr, 0, written);
+          addr += written;
         }
+
         while(n > 0){
-          size_t page_addr = addr & EEPROM_PAGE_ADDR_MASK;
-          size_t written = min((N_t)EEPROM_PAGE_SIZE, n)-page_addr;
+          size_t written = min((N_t)EEPROM_PAGE_SIZE, n);
           n-=written;
           fillPageEEPROM(addr, 0, written); // fill page with 0
           addr += written;
         }
         
-        
         SerialWriteType(Ans::OK);
     }break;
-    case Command::CheckBytes:{
-      
-      for(int i = 0;i <= addr; ++i){
-        if(readEEPROM(i) != data[i])
+    case Command::ReadNAddr:{
+        N_t n;
+        if(SerialReadType(&n) != sizeof(n))
           return false;
-      }
-      // Success
-      SerialWriteType(Ans::OK);
+        N_t read_addr;
+        if(SerialReadType(&read_addr) != sizeof(read_addr))
+          return false;
+
+        SerialWriteType(Ans::OK);
+
+        for(int i=0;i<n;++i)
+          SerialWriteType(readEEPROM(read_addr+i));
+      
     }break;
     case Command::EchoN:{
       N_t n;
@@ -258,6 +204,16 @@ bool parseCommand(){
       // Echo 
       SerialWriteType(n);
     }break;
+    case Command::JumpToAddr:{
+      N_t new_addr;
+      if(SerialReadType(&new_addr) != sizeof(new_addr))
+        return false;
+      addr = new_addr;
+      // OK
+      SerialWriteType(Ans::OK);
+    }break;
+    default: // unimplemented commands
+      return false;
   }
   return true;
 }
@@ -268,3 +224,4 @@ void loop(){
     SerialWriteType(Ans::NOK);
   Serial.flush();
 }
+
